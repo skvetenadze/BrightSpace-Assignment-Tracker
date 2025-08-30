@@ -1,5 +1,7 @@
 requests
-pandas
+icalendar
+recurring-ical-events
+pytz
 gspread
 oauth2client
-pytz
+python-dotenv
