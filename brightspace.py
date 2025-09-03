@@ -21,7 +21,7 @@ load_dotenv()
 SHEET_NAME = os.environ.get("SHEET_NAME", "Assignment Tracker")
 LOCAL_TZ = pytz.timezone(os.environ.get("LOCAL_TZ", "America/New_York"))
 WINDOW_DAYS = int(os.environ.get("WINDOW_DAYS", "14"))
-POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "1800"))  # 30 minutes
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "1800"))  # default: 30 minutes
 
 # Comma-separated list of Brightspace iCal URLs
 ICS_URLS = [u.strip() for u in os.environ.get("BRIGHTSPACE_ICS_URLS", "").split(",") if u.strip()]
@@ -29,7 +29,7 @@ ICS_URLS = [u.strip() for u in os.environ.get("BRIGHTSPACE_ICS_URLS", "").split(
 # Google Sheets auth (service account file OR inline JSON via env)
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE")   # e.g., "credentials.json"
+GOOGLE_CREDENTIALS_FILE = os.environ.get("GOOGLE_CREDENTIALS_FILE")   # e.g., "service_account.json"
 GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS")             # inline JSON (single line)
 
 if GOOGLE_CREDENTIALS_FILE:
@@ -46,16 +46,22 @@ else:
 # Helpers
 # =========================
 def _to_local(dt_obj):
-    """Normalize any dt to LOCAL_TZ (dates get 23:59)."""
+    """
+    Normalize any dt (date or datetime) to LOCAL_TZ, return tz-aware datetime.
+    - Date-only values get assumed time 23:59 local so they appear due that day.
+    - Naive datetimes are treated as UTC.
+    """
     if isinstance(dt_obj, datetime):
         if dt_obj.tzinfo is None:
             dt_obj = pytz.utc.localize(dt_obj)
     else:
+        # date-only
         dt_obj = datetime(dt_obj.year, dt_obj.month, dt_obj.day, 23, 59, 0, tzinfo=pytz.utc)
     return dt_obj.astimezone(LOCAL_TZ)
 
 
 def _event_course(cal, comp):
+    """Infer course name from calendar metadata or categories."""
     calname = cal.get("X-WR-CALNAME")
     if calname:
         return str(calname)
@@ -64,6 +70,7 @@ def _event_course(cal, comp):
 
 
 def _event_uid(comp):
+    """Stable UID including DTSTART stamp so recurring instances don't collide."""
     uid = str(comp.get("UID", "")).strip()
     dtstart = comp.get("DTSTART")
     stamp = ""
@@ -101,6 +108,7 @@ def fetch_assignments_from_brightspace():
             print(f"[WARN] Failed to fetch/parse ICS: {url} -> {e}")
             continue
 
+        # Expand recurring events within window (use UTC bounds)
         try:
             now_utc = now_local.astimezone(pytz.utc)
             end_utc = end_local.astimezone(pytz.utc)
@@ -118,20 +126,21 @@ def fetch_assignments_from_brightspace():
             if not (now_local <= due_local <= end_local):
                 continue
 
-            title = str(comp.get("SUMMARY", "")).strip() or "No Name"
+            title = (str(comp.get("SUMMARY", "")) or "No Name").strip()
             course = _event_course(cal, comp)
             uid = _event_uid(comp)
 
             formatted_due = due_local.strftime("%m/%d/%Y")
             days_left = (due_local - now_local).days
 
-            # Priority logic
+            # ----- Priority thresholds you requested -----
             if days_left <= 4:
                 priority = "High"
             elif days_left <= 9:
                 priority = "Standard"
             else:
                 priority = "Low"
+            # --------------------------------------------
 
             results.append({
                 "Assignment": title,
@@ -139,11 +148,12 @@ def fetch_assignments_from_brightspace():
                 "Status": "Not Started",
                 "Due Date": formatted_due,
                 "Priority Level": priority,
-                "Due Date Raw": due_local,
+                "Due Date Raw": due_local,   # for sort only
                 "UID": uid,
-                "Source": url
+                "Source": url,
             })
 
+    # Sort by due date ascending; drop helper key
     results.sort(key=lambda x: x["Due Date Raw"])
     for r in results:
         r.pop("Due Date Raw", None)
@@ -151,16 +161,17 @@ def fetch_assignments_from_brightspace():
 
 
 # =========================
-# Google Sheets upload
+# Google Sheets upload (updates existing + adds new)
 # =========================
 def upload_to_google_sheets(data):
     client = gspread.authorize(creds)
     sheet = client.open(SHEET_NAME).sheet1
 
+    # Fetch existing titles (column B)
     max_retries = 5
     for attempt in range(max_retries):
         try:
-            existing_assignments = sheet.col_values(2)  # column B
+            existing_titles = sheet.col_values(2)  # column B = Assignment
             break
         except APIError as e:
             print(f"Google API error: {e}. Retrying ({attempt + 1}/{max_retries})...")
@@ -169,45 +180,66 @@ def upload_to_google_sheets(data):
         print("Failed to fetch existing assignments after multiple retries.")
         return
 
-    new_data = [item for item in data if item["Assignment"] not in existing_assignments]
-    if not new_data:
-        print("No new assignments to update.")
-        return
+    title_to_row = {title: idx for idx, title in enumerate(existing_titles, start=1)}
 
-    start_row = len(existing_assignments) + 1
-    rows = []
-    for idx, item in enumerate(new_data):
-        rows.append([
-            item["Assignment"],
-            item["Subject/Course"],
-            item["Status"],
-            item["Due Date"],
-            f"=E{start_row + idx}-TODAY()",
-            item["Priority Level"],
-        ])
+    # Prepare updates for existing rows; gather new items to append
+    updates = []
+    new_items = []
+    for item in data:
+        title = item["Assignment"]
+        if title in title_to_row:
+            r = title_to_row[title]
+            # Refresh Days Left (F) and Priority (G)
+            updates.append({"range": f"F{r}", "values": [[f"=E{r}-TODAY()"]]})
+            updates.append({"range": f"G{r}", "values": [[item["Priority Level"]]]})
+        else:
+            new_items.append(item)
 
-    end_row = start_row + len(rows) - 1
-    cell_range = f"B{start_row}:G{end_row}"
+    # Batch update existing rows
+    if updates:
+        try:
+            sheet.batch_update(updates, value_input_option="USER_ENTERED")
+            print(f"Updated priority/days-left for {len(updates)//2} existing rows.")
+        except APIError as e:
+            print(f"Failed to update existing rows: {e}")
 
-    try:
-        sheet.update(cell_range, rows, value_input_option="USER_ENTERED")
-        print(f"Added {len(new_data)} new assignments to Google Sheet: {SHEET_NAME}, starting from row {start_row}")
-    except APIError as e:
-        print(f"Failed to update Google Sheets: {e}")
+    # Append new rows if any
+    if new_items:
+        start_row = len(existing_titles) + 1
+        rows = [
+            [
+                it["Assignment"],
+                it["Subject/Course"],
+                it["Status"],
+                it["Due Date"],
+                f"=E{start_row + i}-TODAY()",
+                it["Priority Level"],
+            ]
+            for i, it in enumerate(new_items)
+        ]
+        end_row = start_row + len(rows) - 1
+        cell_range = f"B{start_row}:G{end_row}"
+        try:
+            sheet.update(cell_range, rows, value_input_option="USER_ENTERED")
+            print(f"Added {len(new_items)} new assignments starting at row {start_row}.")
+        except APIError as e:
+            print(f"Failed to append new rows: {e}")
+    else:
+        print("No new assignments to add.")
 
 
 # =========================
-# Main loop (30 min)
+# Main loop (poll every POLL_SECONDS)
 # =========================
 if __name__ == "__main__":
     while True:
-        print("Checking Brightspace calendars for new assignments...")
+        print("Checking Brightspace calendars for assignments...")
         try:
             assignments = fetch_assignments_from_brightspace()
             if assignments:
                 upload_to_google_sheets(assignments)
             else:
-                print("No assignments found in the next window.")
+                print("No assignments found in the current window.")
         except Exception as e:
             print(f"[ERROR] {e}")
         print(f"Waiting {POLL_SECONDS} seconds before the next check...")
